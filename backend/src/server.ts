@@ -36,14 +36,14 @@ type TransferSource = 'LIVE_PROVIDER' | 'STALE_PROVIDER';
 
 export interface MatchData { id:string; homeTeam:string; awayTeam:string; score:string; minute:string; kickoff:string; status:string; league:string; venue?:string; dataSource:MatchSource; }
 export interface TransferData { id:string; player:string; date:string; type:string; from:string; to:string; source:TransferSource; }
-export interface VanguardProvider {
-  getMatches(): Promise<{data:MatchData[];dataMode:string;live:boolean;fetchedAt:string;date:string}>;
-  getTransfers(): Promise<{data:TransferData[];dataMode:string;fetchedAt:string;coverage:string}>;
-  queryAI(prompt:string, context?:unknown):Promise<string>;
-}
+export interface MatchesResult { data: MatchData[]; dataMode: string; live: boolean; fetchedAt: string; date: string; }
+export interface TransfersResult { data: TransferData[]; dataMode: string; fetchedAt: string; coverage: string; }
+export interface VanguardProvider { getMatches():Promise<MatchesResult>; getTransfers():Promise<TransfersResult>; queryAI(prompt:string, context?:unknown):Promise<string>; }
 
-interface FixtureResponse { response?: Array<{fixture?:{id?:number;date?:string;venue?:{name?:string};status?:{short?:string;long?:string;elapsed?:number|null}};league?:{id?:number;name?:string};teams?:{home?:{name?:string};away?:{name?:string}};goals?:{home?:number|null;away?:number|null}}> ; errors?:Record<string,unknown> }
-interface TransferResponse { response?: Array<{player?:{id?:number;name?:string};transfers?:Array<{date?:string;type?:string;teams?:{in?:{name?:string};out?:{name?:string}}}>}>; errors?:Record<string,unknown> }
+type Fixture = { fixture?:{id?:number;date?:string;venue?:{name?:string};status?:{short?:string;long?:string;elapsed?:number|null}};league?:{id?:number;name?:string};teams?:{home?:{name?:string};away?:{name?:string}};goals?:{home?:number|null;away?:number|null}};
+type TransferPlayer = { player?:{id?:number;name?:string};transfers?:Array<{date?:string;type?:string;teams?:{in?:{name?:string};out?:{name?:string}}}> };
+interface FixtureResponse { response?: Fixture[]; errors?:Record<string,unknown> }
+interface TransferResponse { response?: TransferPlayer[]; errors?:Record<string,unknown> }
 
 function localDate(timeZone:string):string {
   const parts=new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
@@ -54,10 +54,9 @@ function transferTeamIds():number[] {
   const configured=(env.TRANSFER_TEAM_IDS||'').split(',').map(x=>Number(x.trim())).filter(Number.isInteger);
   return [...new Set(configured.length?configured:DEFAULT_TRANSFER_TEAM_IDS)];
 }
-function mapFixture(f:FixtureResponse['response'][number]):MatchData|null {
+function mapFixture(f:Fixture):MatchData|null {
   const id=f.fixture?.id, home=f.teams?.home?.name, away=f.teams?.away?.name, leagueId=f.league?.id;
   if(!id||!home||!away||!f.fixture?.date)return null;
-  // The league ID is authoritative. This prevents similarly named competitions (for example Russia/Egypt Premier League) from leaking into the feed.
   if(!TOP_FIVE.has(leagueId??-1))return null;
   const short=f.fixture.status?.short||'NS';
   const live=LIVE_CODES.has(short), final=FINAL_CODES.has(short);
@@ -66,8 +65,8 @@ function mapFixture(f:FixtureResponse['response'][number]):MatchData|null {
 }
 
 class ApiFootballProvider implements VanguardProvider {
-  private matchCache:{date:string;at:number;value:Awaited<ReturnType<ApiFootballProvider['getMatches']>>}|null=null;
-  private transferCache:{at:number;value:Awaited<ReturnType<ApiFootballProvider['getTransfers']>>}|null=null;
+  private matchCache:{date:string;at:number;value:MatchesResult}|null=null;
+  private transferCache:{at:number;value:TransfersResult}|null=null;
   private async request<T>(url:URL):Promise<T>{
     if(!env.SPORTS_API_KEY)throw Object.assign(new Error('Sports provider is not configured'),{statusCode:503});
     const r=await fetch(url,{headers:{'x-apisports-key':env.SPORTS_API_KEY,accept:'application/json'},signal:AbortSignal.timeout(9000)});
@@ -75,20 +74,21 @@ class ApiFootballProvider implements VanguardProvider {
     if(!r.ok||(body.errors&&Object.keys(body.errors).length))throw Object.assign(new Error(r.status===429?'Sports provider rate limit reached':'Sports provider request failed'),{statusCode:r.status===429?429:502});
     return body;
   }
-  async getMatches(){
+  async getMatches():Promise<MatchesResult>{
     const date=localDate(env.SPORTS_TIMEZONE),now=Date.now(),fresh=env.SPORTS_CACHE_MINUTES*60000;
     if(this.matchCache?.date===date&&now-this.matchCache.at<fresh)return this.matchCache.value;
     try{
       const url=new URL('https://v3.football.api-sports.io/fixtures');url.searchParams.set('date',date);url.searchParams.set('timezone',env.SPORTS_TIMEZONE);
       const payload=await this.request<FixtureResponse>(url);
-      const data=(payload.response||[]).map(mapFixture).filter((x):x is MatchData=>Boolean(x)).sort((a,b)=>{const rank=(m:MatchData)=>m.dataSource==='LIVE_PROVIDER'?0:m.dataSource==='SCHEDULED_PROVIDER'?1:2;return rank(a)-rank(b)||a.kickoff.localeCompare(b.kickoff)});
-      const value={data,dataMode:'API_FOOTBALL_TOP_FIVE',live:data.some(m=>m.dataSource==='LIVE_PROVIDER'),fetchedAt:new Date().toISOString(),date};this.matchCache={date,at:now,value};return value;
+      const data:MatchData[]=(payload.response||[]).map(mapFixture).filter((x):x is MatchData=>Boolean(x)).sort((a:MatchData,b:MatchData)=>{const rank=(m:MatchData)=>m.dataSource==='LIVE_PROVIDER'?0:m.dataSource==='SCHEDULED_PROVIDER'?1:2;return rank(a)-rank(b)||a.kickoff.localeCompare(b.kickoff)});
+      const value:MatchesResult={data,dataMode:'API_FOOTBALL_TOP_FIVE',live:data.some((m:MatchData)=>m.dataSource==='LIVE_PROVIDER'),fetchedAt:new Date().toISOString(),date};
+      this.matchCache={date,at:now,value};return value;
     }catch(error){
-      if(this.matchCache?.date===date)return {...this.matchCache.value,dataMode:'STALE_API_FOOTBALL_TOP_FIVE',data:this.matchCache.value.data.map(m=>({...m,dataSource:'STALE_PROVIDER' as const}))};
+      if(this.matchCache?.date===date)return {...this.matchCache.value,dataMode:'STALE_API_FOOTBALL_TOP_FIVE',data:this.matchCache.value.data.map((m:MatchData)=>({...m,dataSource:'STALE_PROVIDER' as const}))};
       throw error;
     }
   }
-  async getTransfers(){
+  async getTransfers():Promise<TransfersResult>{
     const now=Date.now(),fresh=env.TRANSFERS_CACHE_HOURS*3600000;
     if(this.transferCache&&now-this.transferCache.at<fresh)return this.transferCache.value;
     try{
@@ -101,10 +101,10 @@ class ApiFootballProvider implements VanguardProvider {
         }catch(teamError){console.warn('[TRANSFER_TEAM_ERROR]',teamId,teamError instanceof Error?teamError.message:'unknown');}
       }
       if(successfulTeams===0)throw Object.assign(new Error('Transfer provider is temporarily unavailable'),{statusCode:502});
-      const data=[...new Map(all.map(t=>[t.id,t])).values()].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,100);
-      const value={data,dataMode:'API_FOOTBALL_TRANSFER_FEED',fetchedAt:new Date().toISOString(),coverage:`${successfulTeams} selected top-five-league clubs`};this.transferCache={at:now,value};return value;
+      const data:TransferData[]=[...new Map(all.map((t:TransferData)=>[t.id,t])).values()].sort((a:TransferData,b:TransferData)=>b.date.localeCompare(a.date)).slice(0,100);
+      const value:TransfersResult={data,dataMode:'API_FOOTBALL_TRANSFER_FEED',fetchedAt:new Date().toISOString(),coverage:`${successfulTeams} selected top-five-league clubs`};this.transferCache={at:now,value};return value;
     }catch(error){
-      if(this.transferCache)return {...this.transferCache.value,dataMode:'STALE_API_FOOTBALL_TRANSFER_FEED',data:this.transferCache.value.data.map(t=>({...t,source:'STALE_PROVIDER' as const}))};
+      if(this.transferCache)return {...this.transferCache.value,dataMode:'STALE_API_FOOTBALL_TRANSFER_FEED',data:this.transferCache.value.data.map((t:TransferData)=>({...t,source:'STALE_PROVIDER' as const}))};
       throw error;
     }
   }
@@ -112,18 +112,18 @@ class ApiFootballProvider implements VanguardProvider {
 }
 
 class VerifiedSnapshotProvider implements VanguardProvider {
-  async getMatches(){return{data:[],dataMode:'VERIFIED_SNAPSHOT',live:false,fetchedAt:new Date().toISOString(),date:localDate(env.SPORTS_TIMEZONE)}}
-  async getTransfers(){return{data:[],dataMode:'VERIFIED_SNAPSHOT',fetchedAt:new Date().toISOString(),coverage:'No live provider configured'}}
+  async getMatches():Promise<MatchesResult>{return{data:[],dataMode:'VERIFIED_SNAPSHOT',live:false,fetchedAt:new Date().toISOString(),date:localDate(env.SPORTS_TIMEZONE)}}
+  async getTransfers():Promise<TransfersResult>{return{data:[],dataMode:'VERIFIED_SNAPSHOT',fetchedAt:new Date().toISOString(),coverage:'No live provider configured'}}
   async queryAI():Promise<string>{throw Object.assign(new Error('AI provider is not configured'),{statusCode:503});}
 }
 export class MockProvider implements VanguardProvider {
-  async getMatches(){return{data:[],dataMode:'DEVELOPMENT_MOCK',live:false,fetchedAt:new Date().toISOString(),date:localDate(env.SPORTS_TIMEZONE)}}
-  async getTransfers(){return{data:[],dataMode:'DEVELOPMENT_MOCK',fetchedAt:new Date().toISOString(),coverage:'Development mode'}}
-  async queryAI(prompt:string){return `Development-only AI response for: "${prompt}".`}
+  async getMatches():Promise<MatchesResult>{return{data:[],dataMode:'DEVELOPMENT_MOCK',live:false,fetchedAt:new Date().toISOString(),date:localDate(env.SPORTS_TIMEZONE)}}
+  async getTransfers():Promise<TransfersResult>{return{data:[],dataMode:'DEVELOPMENT_MOCK',fetchedAt:new Date().toISOString(),coverage:'Development mode'}}
+  async queryAI(prompt:string):Promise<string>{return `Development-only AI response for: "${prompt}".`}
 }
 export class ProviderFactory {
   private static provider:VanguardProvider|null=null;
-  static getProvider(){if(!this.provider)this.provider=env.SPORTS_API_KEY?new ApiFootballProvider():env.NODE_ENV==='production'?new VerifiedSnapshotProvider():new MockProvider();return this.provider;}
+  static getProvider():VanguardProvider{if(!this.provider)this.provider=env.SPORTS_API_KEY?new ApiFootballProvider():env.NODE_ENV==='production'?new VerifiedSnapshotProvider():new MockProvider();return this.provider;}
 }
 function sanitize(value:unknown):unknown{if(Array.isArray(value))return value.map(sanitize);if(!value||typeof value!=='object')return value;const out:Record<string,unknown>={};const blocked=['key','token','secret','password','authorization','cookie','database_url'];for(const[k,v]of Object.entries(value))out[k]=blocked.some(x=>k.toLowerCase().includes(x))?'[REDACTED]':sanitize(v);return out;}
 
