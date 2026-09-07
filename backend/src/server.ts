@@ -25,8 +25,9 @@ export const env = parsed.data;
 
 export const aiAskSchema = z.object({ prompt: z.string().min(1).max(1000), context: z.record(z.unknown()).optional() });
 
+// Authoritative API-Football league IDs for ArenaLive's five supported domestic leagues.
 const TOP_FIVE = new Set([39, 140, 78, 135, 61]);
-const TOP_FIVE_NAMES = ['Premier League', 'La Liga', 'Bundesliga', 'Serie A', 'Ligue 1'];
+const TOP_FIVE_NAMES = ['English Premier League', 'La Liga', 'Bundesliga', 'Serie A', 'Ligue 1'];
 const DEFAULT_TRANSFER_TEAM_IDS = [42, 40, 49, 541, 529, 530, 157, 165, 505, 489, 496, 85];
 const LIVE_CODES = new Set(['1H', 'HT', '2H', 'ET', 'BT', 'P', 'LIVE']);
 const FINAL_CODES = new Set(['FT', 'AET', 'PEN']);
@@ -36,7 +37,7 @@ type TransferSource = 'LIVE_PROVIDER' | 'STALE_PROVIDER';
 
 export interface MatchData { id:string; homeTeam:string; awayTeam:string; score:string; minute:string; kickoff:string; status:string; league:string; venue?:string; dataSource:MatchSource; }
 export interface TransferData { id:string; player:string; date:string; type:string; from:string; to:string; source:TransferSource; }
-export interface MatchesResult { data: MatchData[]; dataMode: string; live: boolean; fetchedAt: string; date: string; }
+export interface MatchesResult { data: MatchData[]; dataMode: string; live: boolean; fetchedAt: string; date: string; rangeEnd: string; }
 export interface TransfersResult { data: TransferData[]; dataMode: string; fetchedAt: string; coverage: string; }
 export interface VanguardProvider { getMatches():Promise<MatchesResult>; getTransfers():Promise<TransfersResult>; queryAI(prompt:string, context?:unknown):Promise<string>; }
 
@@ -45,10 +46,14 @@ type TransferPlayer = { player?:{id?:number;name?:string};transfers?:Array<{date
 interface FixtureResponse { response?: Fixture[]; errors?:Record<string,unknown> }
 interface TransferResponse { response?: TransferPlayer[]; errors?:Record<string,unknown> }
 
-function localDate(timeZone:string):string {
-  const parts=new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
+function localDate(timeZone:string, date=new Date()):string {
+  const parts=new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(date);
   const get=(x:string)=>parts.find(p=>p.type===x)?.value||'';
   return `${get('year')}-${get('month')}-${get('day')}`;
+}
+function addDays(dateString:string,days:number):string {
+  const d=new Date(`${dateString}T12:00:00Z`); d.setUTCDate(d.getUTCDate()+days);
+  return d.toISOString().slice(0,10);
 }
 function transferTeamIds():number[] {
   const configured=(env.TRANSFER_TEAM_IDS||'').split(',').map(x=>Number(x.trim())).filter(Number.isInteger);
@@ -57,6 +62,7 @@ function transferTeamIds():number[] {
 function mapFixture(f:Fixture):MatchData|null {
   const id=f.fixture?.id, home=f.teams?.home?.name, away=f.teams?.away?.name, leagueId=f.league?.id;
   if(!id||!home||!away||!f.fixture?.date)return null;
+  // League ID is authoritative. Similar names such as Russia/Egypt Premier League can never pass this check.
   if(!TOP_FIVE.has(leagueId??-1))return null;
   const short=f.fixture.status?.short||'NS';
   const live=LIVE_CODES.has(short), final=FINAL_CODES.has(short);
@@ -65,7 +71,7 @@ function mapFixture(f:Fixture):MatchData|null {
 }
 
 class ApiFootballProvider implements VanguardProvider {
-  private matchCache:{date:string;at:number;value:MatchesResult}|null=null;
+  private matchCache:{range:string;at:number;value:MatchesResult}|null=null;
   private transferCache:{at:number;value:TransfersResult}|null=null;
   private async request<T>(url:URL):Promise<T>{
     if(!env.SPORTS_API_KEY)throw Object.assign(new Error('Sports provider is not configured'),{statusCode:503});
@@ -75,16 +81,18 @@ class ApiFootballProvider implements VanguardProvider {
     return body;
   }
   async getMatches():Promise<MatchesResult>{
-    const date=localDate(env.SPORTS_TIMEZONE),now=Date.now(),fresh=env.SPORTS_CACHE_MINUTES*60000;
-    if(this.matchCache?.date===date&&now-this.matchCache.at<fresh)return this.matchCache.value;
+    const date=localDate(env.SPORTS_TIMEZONE),rangeEnd=addDays(date,7),range=`${date}:${rangeEnd}`,now=Date.now(),fresh=env.SPORTS_CACHE_MINUTES*60000;
+    if(this.matchCache?.range===range&&now-this.matchCache.at<fresh)return this.matchCache.value;
     try{
-      const url=new URL('https://v3.football.api-sports.io/fixtures');url.searchParams.set('date',date);url.searchParams.set('timezone',env.SPORTS_TIMEZONE);
+      // One provider request covers today plus the next seven days, so EPL/Bundesliga do not disappear simply because they have no fixture today.
+      const url=new URL('https://v3.football.api-sports.io/fixtures');
+      url.searchParams.set('from',date);url.searchParams.set('to',rangeEnd);url.searchParams.set('timezone',env.SPORTS_TIMEZONE);
       const payload=await this.request<FixtureResponse>(url);
       const data:MatchData[]=(payload.response||[]).map(mapFixture).filter((x):x is MatchData=>Boolean(x)).sort((a:MatchData,b:MatchData)=>{const rank=(m:MatchData)=>m.dataSource==='LIVE_PROVIDER'?0:m.dataSource==='SCHEDULED_PROVIDER'?1:2;return rank(a)-rank(b)||a.kickoff.localeCompare(b.kickoff)});
-      const value:MatchesResult={data,dataMode:'API_FOOTBALL_TOP_FIVE',live:data.some((m:MatchData)=>m.dataSource==='LIVE_PROVIDER'),fetchedAt:new Date().toISOString(),date};
-      this.matchCache={date,at:now,value};return value;
+      const value:MatchesResult={data,dataMode:'API_FOOTBALL_TOP_FIVE_8_DAY_WINDOW',live:data.some((m:MatchData)=>m.dataSource==='LIVE_PROVIDER'),fetchedAt:new Date().toISOString(),date,rangeEnd};
+      this.matchCache={range,at:now,value};return value;
     }catch(error){
-      if(this.matchCache?.date===date)return {...this.matchCache.value,dataMode:'STALE_API_FOOTBALL_TOP_FIVE',data:this.matchCache.value.data.map((m:MatchData)=>({...m,dataSource:'STALE_PROVIDER' as const}))};
+      if(this.matchCache?.range===range)return {...this.matchCache.value,dataMode:'STALE_API_FOOTBALL_TOP_FIVE',data:this.matchCache.value.data.map((m:MatchData)=>({...m,dataSource:'STALE_PROVIDER' as const}))};
       throw error;
     }
   }
@@ -112,12 +120,12 @@ class ApiFootballProvider implements VanguardProvider {
 }
 
 class VerifiedSnapshotProvider implements VanguardProvider {
-  async getMatches():Promise<MatchesResult>{return{data:[],dataMode:'VERIFIED_SNAPSHOT',live:false,fetchedAt:new Date().toISOString(),date:localDate(env.SPORTS_TIMEZONE)}}
+  async getMatches():Promise<MatchesResult>{return{data:[],dataMode:'VERIFIED_SNAPSHOT',live:false,fetchedAt:new Date().toISOString(),date:localDate(env.SPORTS_TIMEZONE),rangeEnd:localDate(env.SPORTS_TIMEZONE)}}
   async getTransfers():Promise<TransfersResult>{return{data:[],dataMode:'VERIFIED_SNAPSHOT',fetchedAt:new Date().toISOString(),coverage:'No live provider configured'}}
   async queryAI():Promise<string>{throw Object.assign(new Error('AI provider is not configured'),{statusCode:503});}
 }
 export class MockProvider implements VanguardProvider {
-  async getMatches():Promise<MatchesResult>{return{data:[],dataMode:'DEVELOPMENT_MOCK',live:false,fetchedAt:new Date().toISOString(),date:localDate(env.SPORTS_TIMEZONE)}}
+  async getMatches():Promise<MatchesResult>{return{data:[],dataMode:'DEVELOPMENT_MOCK',live:false,fetchedAt:new Date().toISOString(),date:localDate(env.SPORTS_TIMEZONE),rangeEnd:localDate(env.SPORTS_TIMEZONE)}}
   async getTransfers():Promise<TransfersResult>{return{data:[],dataMode:'DEVELOPMENT_MOCK',fetchedAt:new Date().toISOString(),coverage:'Development mode'}}
   async queryAI(prompt:string):Promise<string>{return `Development-only AI response for: "${prompt}".`}
 }
